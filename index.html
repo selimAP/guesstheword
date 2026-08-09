@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  >
+  <meta
+    name="theme-color"
+    content="#111827"
+  >
+
+  <title>GuessTheWord</title>
+
+  <link
+    rel="stylesheet"
+    href="style.css"
+  >
+</head>
+
+<body>
+
+  <div class="app">
+
+    <header class="header">
+
+      <div class="logo">
+        GuessTheWord
+      </div>
+
+      <div class="header-right">
+
+        <div class="stats">
+
+          <div class="stat">
+            <span>XP</span>
+            <strong id="totalXP">0</strong>
+          </div>
+
+          <div class="stat">
+            <span>Streak</span>
+            <strong id="streak">0</strong>
+          </div>
+
+        </div>
+
+        <div class="sound-settings">
+
+          <button
+            id="soundButton"
+            class="sound-button"
+            type="button"
+            aria-label="Sound settings"
+            aria-expanded="false"
+          >
+
+            <svg
+              id="soundIconOn"
+              class="sound-icon"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <path d="M11 5 6.5 9H3v6h3.5L11 19V5Z"/>
+              <path d="M15 9.5a4 4 0 0 1 0 5"/>
+              <path d="M17.8 6.8a8 8 0 0 1 0 10.4"/>
+            </svg>
+
+            <svg
+              id="soundIconOff"
+              class="sound-icon hidden"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <path d="M11 5 6.5 9H3v6h3.5L11 19V5Z"/>
+              <path d="m16 9 5 5"/>
+              <path d="m21 9-5 5"/>
+            </svg>
+
+          </button>
+
+          <div
+            id="soundPanel"
+            class="sound-panel"
+            aria-hidden="true"
+          >
+
+            <div class="sound-panel-header">
+
+              <div>
+                <strong>Sound</strong>
+                <span>Game audio</span>
+              </div>
+
+              <button
+                id="muteButton"
+                class="mute-button"
+                type="button"
+              >
+                Mute
+              </button>
+
+            </div>
+
+            <div class="volume-control">
+
+              <svg
+                class="volume-small-icon"
+                viewBox="0 0 24 24"
+                aria-hidden="true"
+              >
+                <path d="M11 5 6.5 9H3v6h3.5L11 19V5Z"/>
+              </svg>
+
+              <input
+                id="volumeSlider"
+                class="volume-slider"
+                type="range"
+                min="0"
+                max="100"
+                value="65"
+                aria-label="Volume"
+              >
+
+              <span
+                id="volumeValue"
+                class="volume-value"
+              >
+                65
+              </span>
+
+            </div>
+
+          </div>
+
+        </div>
+
+      </div>
+
+    </header>
+
+    <main
+      id="game"
+      class="game"
+    >
+
+      <section class="game-intro">
+
+        <div class="language-pill">
+          English
+        </div>
+
+        <h1>
+          Guess the word
+        </h1>
+
+        <p class="game-meta">
+
+          <span id="wordLength">
+            —
+          </span>
+
+          <span class="dot">
+            ·
+          </span>
+
+          <span>
+            <strong id="currentXP">
+              100
+            </strong>
+            XP
+          </span>
+
+        </p>
+
+      </section>
+
+      <section
+        class="word-section"
+        aria-label="Word guessing area"
+      >
+
+        <div
+          id="letters"
+          class="word"
+        ></div>
+
+      </section>
+
+      <form
+        id="guessForm"
+        class="guess-form"
+      >
+
+        <input
+          id="guessInput"
+          type="text"
+          placeholder="Enter your guess"
+          autocomplete="off"
+          autocapitalize="none"
+          spellcheck="false"
+        >
+
+        <span class="enter-hint">
+          Enter ↵
+        </span>
+
+      </form>
+
+      <p
+        id="feedback"
+        class="feedback"
+        aria-live="polite"
+      >
+        Loading a new word...
+      </p>
+
+      <section
+        id="result"
+        class="result"
+      >
+
+        <div class="result-line"></div>
+
+        <div class="result-header">
+
+          <div class="result-title-wrapper">
+
+            <span
+              id="resultLabel"
+              class="result-label"
+            >
+              Word learned
+            </span>
+
+            <h2 id="resultWord"></h2>
+
+            <p
+              id="resultTranslation"
+              class="result-translation"
+            ></p>
+
+          </div>
+
+          <div class="earned-xp">
+            +<span id="earnedXP">0</span> XP
+          </div>
+
+        </div>
+
+        <article class="meaning-card">
+
+          <span class="learning-label">
+            Meaning
+          </span>
+
+          <p id="resultMeaning"></p>
+
+        </article>
+
+        <div class="learning-grid">
+
+          <article class="learning-item">
+
+            <span class="learning-label">
+              Example
+            </span>
+
+            <p id="resultExample"></p>
+
+          </article>
+
+          <article class="learning-item">
+
+            <span class="learning-label">
+              German example
+            </span>
+
+            <p id="resultGermanExample"></p>
+
+          </article>
+
+          <article class="learning-item">
+
+            <span class="learning-label">
+              Word type
+            </span>
+
+            <p id="resultWordType"></p>
+
+          </article>
+
+        </div>
+
+        <p class="source-note">
+          Example pair from Tatoeba
+        </p>
+
+        <button
+          id="nextButton"
+          class="next-button"
+          type="button"
+        >
+
+          <span>
+            Next word
+          </span>
+
+          <span class="next-shortcut">
+            Enter ↵
+          </span>
+
+        </button>
+
+      </section>
+
+      <section class="help">
+
+        <button
+          id="helpToggle"
+          class="help-toggle"
+          type="button"
+          aria-expanded="false"
+        >
+
+          <span>
+            Need help?
+          </span>
+
+          <span class="help-icon">
+            +
+          </span>
+
+        </button>
+
+        <div
+          id="helpContent"
+          class="help-content"
+        >
+
+          <div class="help-inner">
+
+            <p class="help-description">
+              Clues become easier step by step.
+              Every clue reduces your XP.
+            </p>
+
+            <div
+              id="hints"
+              class="hints"
+            ></div>
+
+            <button
+              id="giveUpButton"
+              class="give-up-button"
+              type="button"
+            >
+
+              <div>
+
+                <strong>
+                  Show me the word
+                </strong>
+
+                <span>
+                  I don't know this one
+                </span>
+
+              </div>
+
+              <span class="give-up-cost">
+                −100 XP
+              </span>
+
+            </button>
+
+          </div>
+
+        </div>
+
+      </section>
+
+    </main>
+
+  </div>
+
+  <script src="script.js"></script>
+
+</body>
+</html>
