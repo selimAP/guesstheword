@@ -5,12 +5,23 @@ const API = {
   translation: "https://api.mymemory.translated.net/get"
 };
 
+const API_TIMEOUTS = {
+  wordList: 10000,
+  dictionary: 10000,
+  translation: 10000,
+  tatoeba: 12000
+};
+
+const API_COOLDOWN_MS = 20000;
+const API_RATE_LIMIT_COOLDOWN_MS = 60000;
+
 const MIN_WORD_LENGTH = 3;
 const MAX_WORD_LENGTH = 16;
 const MAX_VOCABULARY_RANK = 5500;
 const RECENT_WORD_LIMIT = 250;
 const PREFETCH_TARGET = 2;
-const PREPARE_ATTEMPTS = 22;
+const PREPARE_ATTEMPTS = 18;
+const TEMPORARY_WORD_COOLDOWN_MS = 45000;
 
 const WORD_CACHE_KEY = "guessTheWordContentV5";
 const RECENT_WORDS_KEY = "guessTheWordRecentWordsV3";
@@ -101,7 +112,51 @@ const STOP_WORDS = new Set([
   "did",
   "because",
   "although",
-  "however"
+  "however",
+  "after",
+  "before",
+  "all"
+]);
+
+const PROPER_NAME_WORDS = new Set([
+  "michael",
+  "sean",
+  "jennifer",
+  "robert",
+  "david",
+  "mary",
+  "richard",
+  "joseph",
+  "thomas",
+  "charles",
+  "christopher",
+  "daniel",
+  "matthew",
+  "anthony",
+  "donald",
+  "steven",
+  "andrew",
+  "joshua",
+  "kevin",
+  "brian",
+  "george",
+  "edward",
+  "ronald",
+  "jason",
+  "jeffrey",
+  "ryan",
+  "gary",
+  "eric",
+  "jacob",
+  "nicholas",
+  "jonathan",
+  "justin",
+  "brandon",
+  "benjamin",
+  "samuel",
+  "gregory",
+  "jackson",
+  "arizona"
 ]);
 
 const fallbackWords = [
@@ -194,14 +249,29 @@ const fallbackWords = [
   }
 ];
 
+class ApiRequestError extends Error {
+  constructor(source, message, temporary = true, silent = false) {
+    super(message);
+
+    this.name = "ApiRequestError";
+    this.source = source;
+    this.temporary = temporary;
+    this.silent = silent;
+  }
+}
+
 let vocabulary = [];
 let vocabularySet = new Set();
 let vocabularyRank = new Map();
 let vocabularyLoaded = false;
 
 let wordQueue = [];
+
 const preparingWords = new Set();
 const failedWords = new Set();
+const temporaryWordFailures = new Map();
+const apiCooldowns = new Map();
+
 let prefetchPromise = null;
 
 const audioFiles = {
@@ -264,6 +334,7 @@ const hintTypes = [
   {
     name: "English example",
     cost: 10,
+
     getText() {
       return maskTargetWord(currentWord.englishExample, currentWord.word);
     }
@@ -272,6 +343,7 @@ const hintTypes = [
   {
     name: "English definition",
     cost: 15,
+
     getText() {
       return currentWord.definition;
     }
@@ -280,6 +352,7 @@ const hintTypes = [
   {
     name: "German example",
     cost: 20,
+
     getText() {
       return currentWord.germanExample;
     }
@@ -288,8 +361,10 @@ const hintTypes = [
   {
     name: "Reveal next letter",
     cost: 25,
+
     getText() {
       revealNextLetter();
+
       return "The next letter has been revealed.";
     }
   },
@@ -297,6 +372,7 @@ const hintTypes = [
   {
     name: "German word",
     cost: 30,
+
     getText() {
       return currentWord.german;
     }
@@ -432,9 +508,77 @@ document.addEventListener("click", event => {
   closeSoundPanel();
 });
 
+function setApiCooldown(source, duration = API_COOLDOWN_MS) {
+  apiCooldowns.set(source, Date.now() + duration);
+}
+
+function getApiCooldownRemaining(source) {
+  const until = apiCooldowns.get(source);
+
+  if (!until) return 0;
+
+  const remaining = until - Date.now();
+
+  if (remaining <= 0) {
+    apiCooldowns.delete(source);
+
+    return 0;
+  }
+
+  return remaining;
+}
+
+function throwIfApiCoolingDown(source) {
+  const remaining = getApiCooldownRemaining(source);
+
+  if (remaining <= 0) return;
+
+  throw new ApiRequestError(
+    source,
+    `API temporarily paused for ${Math.ceil(remaining / 1000)} more seconds.`,
+    true,
+    true
+  );
+}
+
+function isTemporaryHttpStatus(status) {
+  return status === 408 || status === 425 || status === 429 || status >= 500;
+}
+
+function handleTemporaryHttpError(response, source) {
+  if (response.ok) return;
+  if (!isTemporaryHttpStatus(response.status)) return;
+
+  const cooldown = response.status === 429 ? API_RATE_LIMIT_COOLDOWN_MS : API_COOLDOWN_MS;
+
+  setApiCooldown(source, cooldown);
+
+  throw new ApiRequestError(source, `HTTP ${response.status}`, true);
+}
+
+function markTemporaryWordFailure(word) {
+  temporaryWordFailures.set(word, Date.now() + TEMPORARY_WORD_COOLDOWN_MS);
+}
+
+function isTemporarilyUnavailableWord(word) {
+  const until = temporaryWordFailures.get(word);
+
+  if (!until) return false;
+
+  if (Date.now() >= until) {
+    temporaryWordFailures.delete(word);
+
+    return false;
+  }
+
+  return true;
+}
+
 async function loadVocabulary() {
   try {
-    const response = await fetchWithTimeout(API.wordList, 7000);
+    const response = await fetchWithTimeout(API.wordList, API_TIMEOUTS.wordList, "Word list");
+
+    handleTemporaryHttpError(response, "Word list");
 
     if (!response.ok) {
       throw new Error("Word list unavailable.");
@@ -450,9 +594,7 @@ async function loadVocabulary() {
 
     vocabularySet = new Set(allWords);
 
-    vocabularyRank = new Map(
-      allWords.map((word, index) => [word, index + 1])
-    );
+    vocabularyRank = new Map(allWords.map((word, index) => [word, index + 1]));
 
     vocabulary = allWords
       .map((word, index) => ({
@@ -465,20 +607,15 @@ async function loadVocabulary() {
 
     console.log(`Vocabulary ready: ${vocabulary.length} words`);
   } catch (error) {
-    console.warn("Could not load vocabulary:", error);
+    console.warn("Could not load online vocabulary. Using fallback words.");
 
     vocabulary = fallbackWords.map(item => ({
       word: item.word,
       rank: item.rank
     }));
 
-    vocabularySet = new Set(
-      vocabulary.map(item => item.word)
-    );
-
-    vocabularyRank = new Map(
-      vocabulary.map(item => [item.word, item.rank])
-    );
+    vocabularySet = new Set(vocabulary.map(item => item.word));
+    vocabularyRank = new Map(vocabulary.map(item => [item.word, item.rank]));
 
     vocabularyLoaded = true;
   }
@@ -488,6 +625,7 @@ function isGoodGameWord(word) {
   if (word.length < MIN_WORD_LENGTH) return false;
   if (word.length > MAX_WORD_LENGTH) return false;
   if (STOP_WORDS.has(word)) return false;
+  if (PROPER_NAME_WORDS.has(word)) return false;
   if (isLikelyInflectedForm(word)) return false;
 
   return true;
@@ -517,16 +655,26 @@ function isLikelyInflectedForm(word) {
   if (word.endsWith("ed")) {
     const stem = word.slice(0, -2);
 
-    if (vocabularySet.has(stem) || vocabularySet.has(stem + "e")) {
-      return true;
+    if (vocabularySet.has(stem)) return true;
+    if (vocabularySet.has(stem + "e")) return true;
+
+    if (stem.length >= 3 && stem.at(-1) === stem.at(-2)) {
+      const undoubledStem = stem.slice(0, -1);
+
+      if (vocabularySet.has(undoubledStem)) return true;
     }
   }
 
   if (word.endsWith("ing")) {
     const stem = word.slice(0, -3);
 
-    if (vocabularySet.has(stem) || vocabularySet.has(stem + "e")) {
-      return true;
+    if (vocabularySet.has(stem)) return true;
+    if (vocabularySet.has(stem + "e")) return true;
+
+    if (stem.length >= 3 && stem.at(-1) === stem.at(-2)) {
+      const undoubledStem = stem.slice(0, -1);
+
+      if (vocabularySet.has(undoubledStem)) return true;
     }
   }
 
@@ -556,6 +704,7 @@ function chooseVocabularyCandidate() {
     if (word.length < minLength || word.length > maxLength) return false;
     if (recent.has(word)) return false;
     if (failedWords.has(word)) return false;
+    if (isTemporarilyUnavailableWord(word)) return false;
     if (preparingWords.has(word)) return false;
     if (currentWord && currentWord.word === word) return false;
     if (wordQueue.some(item => item.word === word)) return false;
@@ -567,13 +716,14 @@ function chooseVocabularyCandidate() {
     candidates = vocabulary.filter(entry => {
       const word = entry.word;
 
-      return (
-        !recent.has(word) &&
-        !failedWords.has(word) &&
-        !preparingWords.has(word) &&
-        (!currentWord || currentWord.word !== word) &&
-        !wordQueue.some(item => item.word === word)
-      );
+      if (recent.has(word)) return false;
+      if (failedWords.has(word)) return false;
+      if (isTemporarilyUnavailableWord(word)) return false;
+      if (preparingWords.has(word)) return false;
+      if (currentWord && currentWord.word === word) return false;
+      if (wordQueue.some(item => item.word === word)) return false;
+
+      return true;
     });
   }
 
@@ -631,10 +781,7 @@ async function startGame() {
 
   if (prefetchPromise) {
     try {
-      await Promise.race([
-        prefetchPromise,
-        delay(3200)
-      ]);
+      await Promise.race([prefetchPromise, delay(3200)]);
     } catch {}
 
     if (wordQueue.length > 0) {
@@ -708,7 +855,7 @@ function prefetchNextWords() {
       prefetchPromise = null;
 
       if (wordQueue.length < PREFETCH_TARGET) {
-        setTimeout(prefetchNextWords, 1400);
+        setTimeout(prefetchNextWords, 4000);
       }
     });
 }
@@ -717,11 +864,7 @@ async function fillWordQueue() {
   while (wordQueue.length < PREFETCH_TARGET) {
     const missing = PREFETCH_TARGET - wordQueue.length;
 
-    const jobs = Array.from(
-      { length: missing },
-      () => prepareNextWord()
-    );
-
+    const jobs = Array.from({ length: missing }, () => prepareNextWord());
     const results = await Promise.all(jobs);
 
     let added = 0;
@@ -745,10 +888,7 @@ async function fillWordQueue() {
     }
   }
 
-  console.log(
-    "Ready in background:",
-    wordQueue.map(item => item.word)
-  );
+  console.log("Ready in background:", wordQueue.map(item => item.word));
 }
 
 async function prepareNextWord() {
@@ -801,6 +941,7 @@ async function prepareNextWord() {
 
       if (!prepared) {
         failedWords.add(word);
+
         continue;
       }
 
@@ -813,9 +954,20 @@ async function prepareNextWord() {
       return prepared;
     } catch (error) {
       preparingWords.delete(word);
+
+      if (error instanceof ApiRequestError && error.temporary) {
+        markTemporaryWordFailure(word);
+
+        if (!error.silent) {
+          console.warn(`[${error.source}] ${error.message} while preparing "${word}". Using another word or fallback.`);
+        }
+
+        return null;
+      }
+
       failedWords.add(word);
 
-      console.warn(`Skipping "${word}"`, error);
+      console.warn(`Skipping "${word}":`, error);
     }
   }
 
@@ -830,11 +982,7 @@ async function prepareWordContent(word, rank) {
 
   if (!dictionaryData || !germanWord) return null;
 
-  const examplePair = await fetchTatoebaExample(
-    word,
-    dictionaryData.wordType,
-    germanWord
-  );
+  const examplePair = await fetchTatoebaExample(word, dictionaryData.wordType, germanWord);
 
   if (!examplePair) return null;
 
@@ -851,10 +999,10 @@ async function prepareWordContent(word, rank) {
 }
 
 async function fetchDictionaryData(word) {
-  const response = await fetchWithTimeout(
-    API.dictionary + encodeURIComponent(word),
-    6000
-  );
+  const url = API.dictionary + encodeURIComponent(word);
+  const response = await fetchWithTimeout(url, API_TIMEOUTS.dictionary, "DictionaryAPI");
+
+  handleTemporaryHttpError(response, "DictionaryAPI");
 
   if (!response.ok) return null;
 
@@ -975,9 +1123,7 @@ function scoreDefinition(candidate) {
 }
 
 function cleanDefinition(definition) {
-  let cleaned = String(definition)
-    .replace(/\s+/g, " ")
-    .trim();
+  let cleaned = String(definition).replace(/\s+/g, " ").trim();
 
   cleaned = cleaned.replace(/^\([^)]{1,100}\)\s*/, "");
 
@@ -995,10 +1141,10 @@ async function fetchGermanWordTranslation(word) {
   params.set("langpair", "en|de");
 
   try {
-    const response = await fetchWithTimeout(
-      `${API.translation}?${params.toString()}`,
-      6000
-    );
+    const url = `${API.translation}?${params.toString()}`;
+    const response = await fetchWithTimeout(url, API_TIMEOUTS.translation, "MyMemory");
+
+    handleTemporaryHttpError(response, "MyMemory");
 
     if (!response.ok) return "";
 
@@ -1030,18 +1176,20 @@ async function fetchGermanWordTranslation(word) {
         text: cleanGermanWordTranslation(candidate.text),
         confidence: candidate.confidence
       }))
-      .filter(candidate => {
-        return isUsableGermanTranslation(candidate.text, word);
-      });
+      .filter(candidate => isUsableGermanTranslation(candidate.text, word));
 
     if (cleaned.length === 0) return "";
 
-    cleaned.sort(
-      (a, b) => scoreIsolatedTranslation(b) - scoreIsolatedTranslation(a)
-    );
+    cleaned.sort((a, b) => scoreIsolatedTranslation(b) - scoreIsolatedTranslation(a));
 
     return cleaned[0].text;
-  } catch {
+  } catch (error) {
+    if (error instanceof ApiRequestError) {
+      throw error;
+    }
+
+    console.warn(`[MyMemory] Could not translate "${word}".`);
+
     return "";
   }
 }
@@ -1069,10 +1217,7 @@ function cleanGermanWordTranslation(text) {
 function isUsableGermanTranslation(translation, englishWord) {
   if (!translation) return false;
   if (translation.length > 50) return false;
-
-  if (translation.toLowerCase() === englishWord.toLowerCase()) {
-    return false;
-  }
+  if (translation.toLowerCase() === englishWord.toLowerCase()) return false;
 
   const wordCount = translation.split(/\s+/).length;
 
@@ -1082,66 +1227,21 @@ function isUsableGermanTranslation(translation, englishWord) {
 }
 
 async function fetchTatoebaExample(word, wordType, germanWord) {
-  let pairs = await queryTatoeba({
-    word,
-    wordCount: "6-12",
-    nativeOnly: true
-  });
+  const pairs = await queryTatoeba(word);
 
-  pairs = filterAndScoreExamplePairs(
-    pairs,
-    word,
-    wordType,
-    germanWord
-  );
+  const scoredPairs = filterAndScoreExamplePairs(pairs, word, wordType, germanWord);
 
-  if (pairs.length > 0) {
-    return pairs[0];
-  }
+  if (scoredPairs.length === 0) return null;
 
-  pairs = await queryTatoeba({
-    word,
-    wordCount: "6-13",
-    nativeOnly: false
-  });
-
-  pairs = filterAndScoreExamplePairs(
-    pairs,
-    word,
-    wordType,
-    germanWord
-  );
-
-  if (pairs.length > 0) {
-    return pairs[0];
-  }
-
-  pairs = await queryTatoeba({
-    word,
-    wordCount: "5-14",
-    nativeOnly: false
-  });
-
-  pairs = filterAndScoreExamplePairs(
-    pairs,
-    word,
-    wordType,
-    germanWord
-  );
-
-  if (pairs.length > 0) {
-    return pairs[0];
-  }
-
-  return null;
+  return scoredPairs[0];
 }
 
-async function queryTatoeba({ word, wordCount, nativeOnly }) {
+async function queryTatoeba(word) {
   const params = new URLSearchParams();
 
   params.set("lang", "eng");
   params.set("q", `=${word}`);
-  params.set("word_count", wordCount);
+  params.set("word_count", "5-14");
   params.set("is_unapproved", "no");
   params.set("is_orphan", "no");
   params.set("tag", "!idiom,proverb");
@@ -1151,18 +1251,13 @@ async function queryTatoeba({ word, wordCount, nativeOnly }) {
   params.set("trans:is_unapproved", "no");
   params.set("trans:is_orphan", "no");
 
-  if (nativeOnly) {
-    params.set("is_native", "yes");
-    params.set("trans:is_native", "yes");
-  }
-
   params.set("sort", "relevance");
-  params.set("limit", "30");
+  params.set("limit", "20");
 
-  const response = await fetchWithTimeout(
-    `${API.tatoeba}?${params.toString()}`,
-    7000
-  );
+  const url = `${API.tatoeba}?${params.toString()}`;
+  const response = await fetchWithTimeout(url, API_TIMEOUTS.tatoeba, "Tatoeba");
+
+  handleTemporaryHttpError(response, "Tatoeba");
 
   if (!response.ok) return [];
 
@@ -1177,9 +1272,7 @@ async function queryTatoeba({ word, wordCount, nativeOnly }) {
     if (!english) continue;
     if (!containsWholeWord(english, word)) continue;
 
-    const translations = Array.isArray(sentence.translations)
-      ? sentence.translations
-      : [];
+    const translations = Array.isArray(sentence.translations) ? sentence.translations : [];
 
     for (const translation of translations) {
       if (translation.lang !== "deu") continue;
@@ -1215,14 +1308,8 @@ function isGoodExamplePair(pair, word, germanWord) {
   if (englishTokens.length < 5) return false;
   if (englishTokens.length > 14) return false;
   if (!containsWholeWord(pair.english, word)) return false;
-
-  if (/[;:{}[\]]/.test(pair.english)) {
-    return false;
-  }
-
-  if (!germanTranslationFitsExample(germanWord, pair.german)) {
-    return false;
-  }
+  if (/[;:{}[\]]/.test(pair.english)) return false;
+  if (!germanTranslationFitsExample(germanWord, pair.german)) return false;
 
   return true;
 }
@@ -1303,11 +1390,7 @@ function scoreExamplePair(pair, word, wordType) {
     score += 3;
   }
 
-  score += scorePartOfSpeechUsage(
-    pair.english,
-    word,
-    wordType
-  );
+  score += scorePartOfSpeechUsage(pair.english, word, wordType);
 
   return score;
 }
@@ -1356,10 +1439,7 @@ function scorePartOfSpeechUsage(sentence, word, wordType) {
       return -4;
     }
 
-    if (
-      next &&
-      !["to", "with", "at", "of", "for", "and", "but"].includes(next)
-    ) {
+    if (next && !["to", "with", "at", "of", "for", "and", "but"].includes(next)) {
       return -2;
     }
 
@@ -1438,13 +1518,7 @@ function getCachedWord(word) {
 
   if (!cached) return null;
 
-  if (
-    !cached.german ||
-    !cached.definition ||
-    !cached.englishExample ||
-    !cached.germanExample ||
-    !cached.wordType
-  ) {
+  if (!cached.german || !cached.definition || !cached.englishExample || !cached.germanExample || !cached.wordType) {
     return null;
   }
 
@@ -1461,25 +1535,17 @@ function saveWordToCache(wordData) {
   if (entries.length > 500) {
     const trimmed = entries.slice(-500);
 
-    localStorage.setItem(
-      WORD_CACHE_KEY,
-      JSON.stringify(Object.fromEntries(trimmed))
-    );
+    localStorage.setItem(WORD_CACHE_KEY, JSON.stringify(Object.fromEntries(trimmed)));
 
     return;
   }
 
-  localStorage.setItem(
-    WORD_CACHE_KEY,
-    JSON.stringify(cache)
-  );
+  localStorage.setItem(WORD_CACHE_KEY, JSON.stringify(cache));
 }
 
 function getRecentWords() {
   try {
-    const data = JSON.parse(
-      localStorage.getItem(RECENT_WORDS_KEY)
-    );
+    const data = JSON.parse(localStorage.getItem(RECENT_WORDS_KEY));
 
     return Array.isArray(data) ? data : [];
   } catch {
@@ -1496,24 +1562,13 @@ function addRecentWord(word) {
     recent.shift();
   }
 
-  localStorage.setItem(
-    RECENT_WORDS_KEY,
-    JSON.stringify(recent)
-  );
+  localStorage.setItem(RECENT_WORDS_KEY, JSON.stringify(recent));
 }
 
 function isAlreadyQueuedOrCurrent(word) {
-  if (currentWord && currentWord.word === word) {
-    return true;
-  }
-
-  if (wordQueue.some(item => item.word === word)) {
-    return true;
-  }
-
-  if (getRecentWords().includes(word)) {
-    return true;
-  }
+  if (currentWord && currentWord.word === word) return true;
+  if (wordQueue.some(item => item.word === word)) return true;
+  if (getRecentWords().includes(word)) return true;
 
   return false;
 }
@@ -1523,25 +1578,26 @@ function getFallbackWord() {
 
   let available = fallbackWords.filter(item => {
     if (recent.has(item.word)) return false;
-
-    if (currentWord && currentWord.word === item.word) {
-      return false;
-    }
-
-    if (wordQueue.some(queued => queued.word === item.word)) {
-      return false;
-    }
+    if (currentWord && currentWord.word === item.word) return false;
+    if (wordQueue.some(queued => queued.word === item.word)) return false;
 
     return true;
   });
 
   if (available.length === 0) {
+    available = fallbackWords.filter(item => {
+      if (currentWord && currentWord.word === item.word) return false;
+      if (wordQueue.some(queued => queued.word === item.word)) return false;
+
+      return true;
+    });
+  }
+
+  if (available.length === 0) {
     available = fallbackWords;
   }
 
-  return available[
-    Math.floor(Math.random() * available.length)
-  ];
+  return available[Math.floor(Math.random() * available.length)];
 }
 
 function maskTargetWord(sentence, word) {
@@ -1582,19 +1638,10 @@ function renderHints() {
     button.addEventListener("click", () => {
       if (solved || loadingWord || index !== hintIndex) return;
 
-      useHint(
-        hint,
-        index,
-        item,
-        button,
-        content
-      );
+      useHint(hint, index, item, button, content);
     });
 
-    item.append(
-      button,
-      content
-    );
+    item.append(button, content);
 
     hintsElement.appendChild(item);
   });
@@ -1638,9 +1685,7 @@ function revealNextLetter() {
 
   if (allLettersKnown()) {
     setTimeout(() => {
-      finishRound({
-        gaveUp: false
-      });
+      finishRound({ gaveUp: false });
     }, 600);
   }
 }
@@ -1747,10 +1792,7 @@ function renderLetters(newlyDiscovered = []) {
 
       if (newlyDiscovered.includes(index)) {
         box.classList.add("just-discovered");
-
-        box.style.animationDelay = `${
-          newlyDiscovered.indexOf(index) * 90
-        }ms`;
+        box.style.animationDelay = `${newlyDiscovered.indexOf(index) * 90}ms`;
       }
     } else if (typed[index]) {
       box.textContent = typed[index].toUpperCase();
@@ -1764,9 +1806,7 @@ function renderLetters(newlyDiscovered = []) {
 guessInput.addEventListener("input", function () {
   if (!currentWord) return;
 
-  this.value = this.value
-    .replace(/[^a-zA-Z]/g, "")
-    .slice(0, currentWord.word.length);
+  this.value = this.value.replace(/[^a-zA-Z]/g, "").slice(0, currentWord.word.length);
 
   renderLetters();
 });
@@ -1776,27 +1816,18 @@ guessForm.addEventListener("submit", event => {
 
   if (solved || loadingWord || !currentWord) return;
 
-  const guess = guessInput.value
-    .trim()
-    .toLowerCase();
+  const guess = guessInput.value.trim().toLowerCase();
 
   if (guess.length !== currentWord.word.length) {
-    invalidGuess(
-      `Enter all ${currentWord.word.length} letters.`
-    );
+    invalidGuess(`Enter all ${currentWord.word.length} letters.`);
 
     return;
   }
 
-  const knownPrefix = currentWord.word.slice(
-    0,
-    knownPrefixLength
-  );
+  const knownPrefix = currentWord.word.slice(0, knownPrefixLength);
 
   if (!guess.startsWith(knownPrefix)) {
-    invalidGuess(
-      `The word starts with "${knownPrefix.toUpperCase()}".`
-    );
+    invalidGuess(`The word starts with "${knownPrefix.toUpperCase()}".`);
 
     return;
   }
@@ -1810,9 +1841,7 @@ function checkGuess(guess) {
   const answer = currentWord.word;
 
   if (guess === answer) {
-    finishRound({
-      gaveUp: false
-    });
+    finishRound({ gaveUp: false });
 
     return;
   }
@@ -1827,7 +1856,6 @@ function checkGuess(guess) {
     }
 
     letterOrigins[index] = "player";
-
     newlyDiscovered.push(index);
 
     knownPrefixLength++;
@@ -1858,9 +1886,7 @@ function checkGuess(guess) {
 
   if (allLettersKnown()) {
     setTimeout(() => {
-      finishRound({
-        gaveUp: false
-      });
+      finishRound({ gaveUp: false });
     }, 520);
 
     return;
@@ -1896,9 +1922,7 @@ giveUpButton.addEventListener("click", () => {
 
   updateXP();
 
-  finishRound({
-    gaveUp: true
-  });
+  finishRound({ gaveUp: true });
 });
 
 function finishRound({ gaveUp: didGiveUp }) {
@@ -1967,36 +1991,18 @@ function animateWin() {
 }
 
 function showResult() {
-  resultLabel.textContent = gaveUp
-    ? "Word revealed"
-    : "Word learned";
+  resultLabel.textContent = gaveUp ? "Word revealed" : "Word learned";
 
   document.getElementById("resultWord").textContent = currentWord.word;
-
-  document.getElementById("resultTranslation").textContent =
-    currentWord.german;
-
-  document.getElementById("earnedXP").textContent = gaveUp
-    ? 0
-    : currentXP;
-
-  document.getElementById("resultMeaning").textContent =
-    currentWord.definition;
-
-  document.getElementById("resultExample").textContent =
-    currentWord.englishExample;
-
-  document.getElementById("resultGermanExample").textContent =
-    currentWord.germanExample;
-
-  document.getElementById("resultWordType").textContent =
-    currentWord.wordType;
+  document.getElementById("resultTranslation").textContent = currentWord.german;
+  document.getElementById("earnedXP").textContent = gaveUp ? 0 : currentXP;
+  document.getElementById("resultMeaning").textContent = currentWord.definition;
+  document.getElementById("resultExample").textContent = currentWord.englishExample;
+  document.getElementById("resultGermanExample").textContent = currentWord.germanExample;
+  document.getElementById("resultWordType").textContent = currentWord.wordType;
 
   if (sourceNote) {
-    sourceNote.textContent =
-      currentWord.exampleSource === "Tatoeba"
-        ? "Example pair from Tatoeba"
-        : "Curated example";
+    sourceNote.textContent = currentWord.exampleSource === "Tatoeba" ? "Example pair from Tatoeba" : "Curated example";
   }
 
   result.classList.add("visible");
@@ -2038,13 +2044,8 @@ function updateXP() {
 }
 
 function loadStats() {
-  const savedXP = Number(
-    localStorage.getItem("guessTheWordXP")
-  );
-
-  const savedStreak = Number(
-    localStorage.getItem("guessTheWordStreak")
-  );
+  const savedXP = Number(localStorage.getItem("guessTheWordXP"));
+  const savedStreak = Number(localStorage.getItem("guessTheWordStreak"));
 
   if (Number.isFinite(savedXP)) {
     totalXP = savedXP;
@@ -2063,10 +2064,15 @@ function saveStats() {
   localStorage.setItem("guessTheWordStreak", streak);
 }
 
-async function fetchWithTimeout(url, timeout) {
+async function fetchWithTimeout(url, timeout, source = "Request") {
+  throwIfApiCoolingDown(source);
+
   const controller = new AbortController();
 
+  let timedOut = false;
+
   const timer = setTimeout(() => {
+    timedOut = true;
     controller.abort();
   }, timeout);
 
@@ -2074,6 +2080,20 @@ async function fetchWithTimeout(url, timeout) {
     return await fetch(url, {
       signal: controller.signal
     });
+  } catch (error) {
+    if (timedOut || error?.name === "AbortError") {
+      setApiCooldown(source);
+
+      throw new ApiRequestError(source, `Timeout after ${timeout} ms.`);
+    }
+
+    if (error instanceof TypeError) {
+      setApiCooldown(source);
+
+      throw new ApiRequestError(source, "Network request failed.");
+    }
+
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -2082,9 +2102,7 @@ async function fetchWithTimeout(url, timeout) {
 function normalizeWord(word) {
   if (typeof word !== "string") return null;
 
-  const cleaned = word
-    .trim()
-    .toLowerCase();
+  const cleaned = word.trim().toLowerCase();
 
   if (!/^[a-z]+$/.test(cleaned)) {
     return null;
@@ -2096,9 +2114,7 @@ function normalizeWord(word) {
 function cleanSentence(text) {
   if (typeof text !== "string") return "";
 
-  return text
-    .replace(/\s+/g, " ")
-    .trim();
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function normalizeGerman(text) {
@@ -2120,16 +2136,11 @@ function containsWholeWord(sentence, word) {
 }
 
 function escapeRegExp(text) {
-  return text.replace(
-    /[.*+?^${}()|[\]\\]/g,
-    "\\$&"
-  );
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function tokenizeEnglish(text) {
-  return text
-    .toLowerCase()
-    .match(/[a-z]+/g) || [];
+  return text.toLowerCase().match(/[a-z]+/g) || [];
 }
 
 function decodeHtmlEntities(text) {
